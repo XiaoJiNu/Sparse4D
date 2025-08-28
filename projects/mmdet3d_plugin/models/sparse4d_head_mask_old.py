@@ -1,3 +1,5 @@
+# 此脚本是针对训练范围要求，如果标注范围与训练范围要求不同，则将过滤gt，生成对应mask后计算对应loss
+
 # Copyright (c) Horizon Robotics. All rights reserved.
 from typing import List, Optional, Tuple, Union
 import warnings
@@ -421,96 +423,163 @@ class Sparse4DHead(BaseModule):
     '''  
     @force_fp32(apply_to=("model_outs"))
     def loss(self, model_outs, data, feature_maps=None):
-        # ===================== 预测损失计算 ======================
-        cls_scores = model_outs["classification"]  # 分类预测分数
-        reg_preds = model_outs["prediction"]       # 回归预测结果
-        quality = model_outs["quality"]            # 质量预测分数
+        """
+        计算损失函数，包括预测损失和去噪损失
+        
+        Args:
+            model_outs: 模型输出，包含分类、预测、质量等信息
+            data: 输入数据，包含真实标签
+            feature_maps: 特征图（可选）
+            
+        Returns:
+            output: 包含各层损失的字典
+        """
+        # ===================== 预测损失 ======================
+        cls_scores = model_outs["classification"]  # 分类分数
+        reg_preds = model_outs["prediction"]       # 回归预测
+        quality = model_outs["quality"]            # 质量分数
         output = {}
         
-        # 遍历每个解码器层的输出
+        # 遍历每个解码器层
         for decoder_idx, (cls, reg, qt) in enumerate(
             zip(cls_scores, reg_preds, quality)
         ):
-            # 截取回归预测到指定长度
+            # 截取回归预测到指定维度
             reg = reg[..., : len(self.reg_weights)]
             
-            # 使用采样器获取目标值和权重
+            # ==================== 采样器前的真实目标过滤 ====================
+            # 在匹配分配前，先过滤真实目标：只保留标注范围内且标注了的类别
+            filtered_gt_cls = []
+            filtered_gt_reg = []
+            
+            for bs_id in range(len(data[self.gt_cls_key])):
+                gt_cls = data[self.gt_cls_key][bs_id]
+                gt_reg = data[self.gt_reg_key][bs_id]
+                
+                if len(gt_cls) == 0:
+                    filtered_gt_cls.append(gt_cls)
+                    filtered_gt_reg.append(gt_reg)
+                    continue
+                
+                # 获取当前batch的过滤条件
+                valid_mask = torch.ones(len(gt_cls), dtype=torch.bool, device=gt_cls.device)
+                
+                if (data['img_metas'][bs_id]).get('class_mask', None) is not None:
+                    # 类别过滤：只保留标注的类别
+                    class_mask = torch.tensor(data['img_metas'][bs_id]['class_mask']).to(gt_cls.device).bool()
+                    cls_valid = class_mask[gt_cls]  # 检查每个真实类别是否被标注
+                    valid_mask = torch.logical_and(valid_mask, cls_valid)
+                    
+                    # 范围过滤：只保留标注范围内的目标
+                    range_mask = data['img_metas'][bs_id]['range_mask']  # [x_min, y_min, x_max, y_max]
+                    gt_x, gt_y = gt_reg[:, 0], gt_reg[:, 1]  # 假设前两维是x,y坐标
+                    range_valid = (range_mask[0] < gt_x) & (gt_x < range_mask[2]) & \
+                                (range_mask[1] < gt_y) & (gt_y < range_mask[3])
+                    valid_mask = torch.logical_and(valid_mask, range_valid)
+                
+                # 应用过滤
+                filtered_gt_cls.append(gt_cls[valid_mask])
+                filtered_gt_reg.append(gt_reg[valid_mask])
+            
+            # ==================== 采样器功能详解 ====================
+            # 使用采样器进行预测和真实目标的匹配分配
+            # 这是目标检测中的关键步骤：解决预测框与真实框的匹配问题
             cls_target, reg_target, reg_weights = self.sampler.sample(
-                cls,
-                reg,
-                data[self.gt_cls_key],
-                data[self.gt_reg_key],
+                cls,          # 预测分类分数 [batch_size, num_queries, num_classes]
+                reg,          # 预测回归参数 [batch_size, num_queries, reg_dims]
+                filtered_gt_cls,  # 过滤后的真实类别标签列表
+                filtered_gt_reg,  # 过滤后的真实边界框列表
             )
+            # 采样器功能详解：
+            # 1. 计算匹配成本：分类成本 + 回归成本
+            #    - 分类成本：基于Focal Loss计算预测类别与真实类别的成本
+            #    - 回归成本：计算预测框与真实框之间的L1距离
+            # 2. 匈牙利算法匹配：使用linear_sum_assignment找到最优分配
+            #    - 每个预测查询(query)最多匹配一个真实目标
+            #    - 每个真实目标最多匹配一个预测查询
+            #    - 总成本最小化
+            # 3. 输出结果：
+            #    - cls_target: 分配给每个查询的目标类别 [batch_size, num_queries]
+            #    - reg_target: 分配给每个查询的目标回归值 [batch_size, num_queries, reg_dims]
+            #    - reg_weights: 每个回归参数的权重 [batch_size, num_queries, reg_dims]
             reg_target = reg_target[..., : len(self.reg_weights)]
             
-            # 创建基础mask：过滤掉全零的回归目标（背景区域）
+            # 创建有效目标的掩码（非全零的回归目标）
             mask = torch.logical_not(torch.all(reg_target == 0, dim=-1))
 
-            # 初始化分类mask为全真值
+            # ==================== 预测结果的二次过滤（双重保障）====================
+            # 注意：这是在采样器匹配后的额外过滤，确保预测结果也在有效范围内
+            # 初始化类别掩码（默认全部为True）
             mask_cls = torch.ones_like(mask)
             
-            # =================== 核心过滤逻辑 ===================
-            # 检查是否存在类别和范围过滤配置
+            # 如果存在类别掩码和距离掩码，对预测结果进行二次过滤
             if (data['img_metas'][0]).get('class_mask',None) is not None:
-                # 遍历batch中的每个样本
+                # 遍历每个batch样本
                 for bs_id in range(len(data['img_metas'])):
-                    # 获取类别掩码：指定哪些类别参与损失计算
+                    # === 第一步：类别过滤 ===
+                    # 获取预定义的类别掩码（指定哪些类别需要保留）
                     class_mask = torch.tensor(data['img_metas'][bs_id]['class_mask']).to(cls.device).bool()
-                    # 获取空间范围掩码：[x_min, y_min, x_max, y_max]
+                    
+                    # 获取距离范围掩码 [x_min, y_min, x_max, y_max]
                     range_mask =  data['img_metas'][bs_id]['range_mask']
                     
-                    # 获取当前样本的预测类别（取最大概率对应的类别索引）
-                    cls_pred = cls[bs_id].max(dim=-1)[1]
-                    # 根据预测类别获取对应的类别掩码
+                    # 获取当前batch中每个检测框的预测类别索引
+                    cls_pred = cls[bs_id].max(dim=-1)[1]  # 取最大值的索引作为预测类别
+                    
+                    # 根据预测类别索引，从class_mask中获取对应的掩码值
+                    # 如果预测类别在允许的类别列表中，则cls_mask为True，否则为False
                     cls_mask = class_mask[cls_pred]
 
                     # 应用类别过滤：只保留允许的类别
-                    mask_cls[bs_id] = torch.logical_and(mask_cls[bs_id],cls_mask)
+                    mask_cls[bs_id] = torch.logical_and(mask_cls[bs_id], cls_mask)
 
-                    # 获取当前样本的回归预测值
-                    reg_pred    = reg[bs_id]
-                    # 创建空间范围掩码：检查预测的x,y坐标是否在指定范围内
-                    # range_mask[0]<x<range_mask[2] and range_mask[1]<y<range_mask[3]
-                    mask_range  = (range_mask[0]<reg_pred[:,0])&(reg_pred[:,0]<range_mask[2])&(range_mask[1]<reg_pred[:,1])&(reg_pred[:,1]<range_mask[3])
+                    # === 第二步：距离范围过滤 ===
+                    # 获取当前batch的回归预测结果（包含位置信息）
+                    reg_pred = reg[bs_id]
+                    
+                    # 构建距离范围掩码：检查预测位置是否在指定范围内
+                    # range_mask格式: [x_min, y_min, x_max, y_max]
+                    # 检查条件：x_min < pred_x < x_max AND y_min < pred_y < y_max
+                    mask_range = (range_mask[0] < reg_pred[:,0]) & (reg_pred[:,0] < range_mask[2]) & \
+                               (range_mask[1] < reg_pred[:,1]) & (reg_pred[:,1] < range_mask[3])
 
-                    # 应用空间范围过滤：只保留在指定范围内的预测
-                    mask_cls[bs_id] = torch.logical_and(mask_cls[bs_id],mask_range)
+                    # 应用距离过滤：只保留在指定范围内的检测结果
+                    mask_cls[bs_id] = torch.logical_and(mask_cls[bs_id], mask_range)
+                    
+            # 双重过滤策略总结：
+            # 1. 采样器前过滤：过滤真实目标，影响匹配分配过程
+            # 2. 采样器后过滤：过滤预测结果，确保损失计算的有效性
+            # 两步过滤确保：只有标注范围内的标注类别参与训练
 
-            # 保存原始有效mask用于回归损失
-            mask_valid = mask.clone()
-
-            # 计算正样本数量，用于损失归一化
+            # 计算正样本数量
             num_pos = max(
                 reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0
             )
             
-            # 如果设置了分类阈值，进一步过滤低置信度预测
+            # 如果设置了分类阈值，进一步过滤掩码
             if self.cls_threshold_to_reg > 0:
                 threshold = self.cls_threshold_to_reg
                 mask = torch.logical_and(
                     mask, cls.max(dim=-1).values.sigmoid() > threshold
                 )
 
-            # =================== 分类损失计算 ===================
-            # 应用类别和范围过滤mask到分类损失
+            # 展平掩码并应用过滤
             mask_cls = mask_cls.flatten(end_dim=1)
-            cls = cls.flatten(end_dim=1)[mask_cls]  # 过滤后的预测分类
+            cls = cls.flatten(end_dim=1)[mask_cls]
             cls_target = cls_target.flatten(end_dim=1)
-            cls_target_ = cls_target[mask_cls]      # 过滤后的目标分类
+            cls_target_ = cls_target[mask_cls]
             
-            # 计算分类损失：只有通过过滤的样本参与分类损失计算
+            # 计算分类损失
             if mask_cls.sum()>0:
                 cls_loss = self.loss_cls(cls, cls_target_, avg_factor=num_pos)
             else:
-                # 如果没有有效样本，设置损失为0
                 cls_loss = (0*cls).sum()
 
-            # =================== 回归损失计算 ===================
-            # 回归损失使用原始的有效mask（不应用类别和范围过滤）
+            # 准备回归损失计算的数据
             mask = mask.reshape(-1)
             reg_weights = reg_weights * reg.new_tensor(self.reg_weights)
-            reg_target = reg_target.flatten(end_dim=1)[mask]  # 使用原始mask
-            reg = reg.flatten(end_dim=1)[mask]               # 使用原始mask
+            reg_target = reg_target.flatten(end_dim=1)[mask]
+            reg = reg.flatten(end_dim=1)[mask]
             reg_weights = reg_weights.flatten(end_dim=1)[mask]
             
             # 处理NaN值
@@ -518,10 +587,12 @@ class Sparse4DHead(BaseModule):
                 reg_target.isnan(), reg.new_tensor(0.0), reg_target
             )
             cls_target = cls_target[mask]
+            
+            # 如果存在质量分数，也进行过滤
             if qt is not None:
                 qt = qt.flatten(end_dim=1)[mask]
 
-            # 计算回归损失：包含所有有效的正样本（不受类别和范围过滤影响）
+            # 计算回归损失
             reg_loss = self.loss_reg(
                 reg,
                 reg_target,
@@ -532,27 +603,33 @@ class Sparse4DHead(BaseModule):
                 cls_target=cls_target,
             )
 
+            # 保存损失到输出字典
             output[f"loss_cls_{decoder_idx}"] = cls_loss
             output.update(reg_loss)
 
+        # 如果没有去噪预测，直接返回
         if "dn_prediction" not in model_outs:
             return output
 
-        # ===================== 去噪损失计算 ======================
-        dn_cls_scores = model_outs["dn_classification"]
-        dn_reg_preds = model_outs["dn_prediction"]
+        # ===================== 去噪损失 ======================
+        dn_cls_scores = model_outs["dn_classification"]  # 去噪分类分数
+        dn_reg_preds = model_outs["dn_prediction"]       # 去噪回归预测
 
+        # 准备去噪损失计算所需的数据
         (
-            dn_valid_mask,
-            dn_cls_target,
-            dn_reg_target,
-            dn_pos_mask,
-            reg_weights,
-            num_dn_pos,
+            dn_valid_mask,    # 去噪有效掩码
+            dn_cls_target,    # 去噪分类目标
+            dn_reg_target,    # 去噪回归目标
+            dn_pos_mask,      # 去噪正样本掩码
+            reg_weights,      # 回归权重
+            num_dn_pos,       # 去噪正样本数量
         ) = self.prepare_for_dn_loss(model_outs)
+        
+        # 遍历每个解码器层计算去噪损失
         for decoder_idx, (cls, reg) in enumerate(
             zip(dn_cls_scores, dn_reg_preds)
         ):
+            # 如果是临时去噪且达到单帧解码器层数，使用临时掩码
             if (
                 "temp_dn_valid_mask" in model_outs
                 and decoder_idx == self.num_single_frame_decoder
@@ -566,11 +643,14 @@ class Sparse4DHead(BaseModule):
                     num_dn_pos,
                 ) = self.prepare_for_dn_loss(model_outs, prefix="temp_")
 
+            # 计算去噪分类损失
             cls_loss = self.loss_cls(
                 cls.flatten(end_dim=1)[dn_valid_mask],
                 dn_cls_target,
                 avg_factor=num_dn_pos,
             )
+            
+            # 计算去噪回归损失
             reg_loss = self.loss_reg(
                 reg.flatten(end_dim=1)[dn_valid_mask][dn_pos_mask][
                     ..., : len(self.reg_weights)
@@ -580,8 +660,11 @@ class Sparse4DHead(BaseModule):
                 weight=reg_weights,
                 suffix=f"_dn_{decoder_idx}",
             )
+            
+            # 保存去噪损失到输出字典
             output[f"loss_cls_dn_{decoder_idx}"] = cls_loss
             output.update(reg_loss)
+            
         return output
 
     def prepare_for_dn_loss(self, model_outs, prefix=""):

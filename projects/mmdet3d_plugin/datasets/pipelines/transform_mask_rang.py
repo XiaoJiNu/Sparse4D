@@ -229,35 +229,70 @@ class MultiScaleDepthMapGenerator(object):
 
 @PIPELINES.register_module()
 class GetClassRangeMask(object):
+    """根据数据源生成类别掩码和范围掩码的数据处理类
+    
+    功能：
+    针对多数据源训练场景，不同数据源可能只包含部分类别的标注，且检测范围也不同。
+    该类根据数据源信息生成对应的类别掩码（class_mask）和范围掩码（range_mask），
+    用于在训练时过滤不相关的类别和范围外的目标。
+    
+    输入参数：
+    - classes: list, 所有类别名称列表
+    - default_range: list/array, 默认检测范围
+    - data_source_with_label: dict, 各数据源包含的类别映射 {数据源名: [类别列表]}
+    - data_source_range: dict, 各数据源的检测范围映射 {数据源名: 范围参数}
+    
+    输出：
+    为输入字典添加以下字段：
+    - class_mask: np.array, 类别掩码，1表示该类别需要训练，0表示忽略
+    - range_mask: np.array, 范围掩码，用于限制目标检测的空间范围
+    """
     def __init__(self,classes,default_range,data_source_with_label,data_source_range,):
-        self.classes = classes
-        self.data_source_with_label = data_source_with_label
-        self.data_source_range = data_source_range
-        self.default_range = default_range
+        self.classes = classes  # 所有类别列表
+        self.data_source_with_label = data_source_with_label  # 数据源-类别映射
+        self.data_source_range = data_source_range  # 数据源-范围映射
+        self.default_range = default_range  # 默认检测范围
 
+        # 构建类别掩码字典，"all"表示使用全部类别
         self.class_mask_all = {"all":[1]*(len(self.classes))}
+        # 为每个数据源生成类别掩码
         for datasource,class_item in self.data_source_with_label.items():
             tmp_mask = []
             for clsname in self.classes:
                 if clsname in class_item:
-                    tmp_mask.append(1)
+                    tmp_mask.append(1)  # 该数据源包含此类别
                 else:
-                    tmp_mask.append(0)
+                    tmp_mask.append(0)  # 该数据源不包含此类别
             self.class_mask_all[datasource] = tmp_mask
 
     def __call__(self, input_dict):
+        """处理输入数据字典，添加类别掩码和范围掩码
+        
+        输入：
+        - input_dict: dict, 包含训练数据的字典，可能包含"data_source"字段
+        
+        输出：
+        - input_dict: dict, 原字典基础上添加"class_mask"和"range_mask"字段
+        """
+        # 如果数据字典中包含数据源信息
         if input_dict.get("data_source",False):
+            # 检查数据源是否在预定义的掩码字典中
             if input_dict["data_source"] not in self.class_mask_all:
                 print(input_dict["data_source"])
+                # 未知数据源使用默认设置
                 input_dict["class_mask"] = self.class_mask_all["all"]
                 input_dict["range_mask"] = self.default_range
             else:
+                # 使用对应数据源的类别掩码和范围掩码
                 input_dict["class_mask"] = self.class_mask_all[input_dict["data_source"]]
                 input_dict["range_mask"] = self.data_source_range[input_dict["data_source"]]
 
         else:
+            # 无数据源信息时使用默认设置
             input_dict["class_mask"] = self.class_mask_all["all"]
             input_dict["range_mask"] = self.default_range
+        
+        # 转换为numpy数组格式
         input_dict["class_mask"] = np.array(input_dict["class_mask"])
         input_dict["range_mask"] = np.array(input_dict["range_mask"])
         return input_dict

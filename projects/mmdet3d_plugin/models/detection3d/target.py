@@ -161,6 +161,29 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
         return cost
 
     def get_dn_anchors(self, cls_target, box_target, gt_instance_id=None):
+        """
+        生成去噪锚点，这是噪声添加的核心函数
+        
+        输入:
+            cls_target: GT分类标签列表，每个元素维度 [N_gt_i]
+            box_target: GT边框列表，每个元素维度 [N_gt_i, bbox_dim]
+            gt_instance_id: GT实例ID列表（可选，用于时序追踪）
+            
+        输出:
+            返回元组包含:
+            - dn_anchor: 噪声锚点，维度 [B, N_dn_total, anchor_dim]
+            - dn_box_target: 噪声回归目标，维度 [B, N_dn_total, bbox_dim]
+            - dn_cls_target: 噪声分类目标，维度 [B, N_dn_total]
+            - attn_mask: 注意力掩码，维度 [N_dn_total, N_dn_total]
+            - valid_mask: 有效掩码，维度 [B, N_dn_total]
+            - dn_id_target: 噪声ID目标（可选）
+            
+        实现逻辑:
+        1. 为每个GT添加随机噪声生成正样本噪声锚点
+        2. 可选添加负样本噪声锚点（更大噪声）
+        3. 通过匈牙利匹配将噪声锚点与GT关联
+        4. 生成注意力掩码防止不同组间交互
+        """
         if self.num_dn_groups <= 0:
             return None
         if self.num_temp_dn_groups <= 0:
@@ -203,20 +226,30 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
             if gt_instance_id is not None:
                 gt_instance_id = gt_instance_id.tile(self.num_dn_groups, 1)
 
-        noise = torch.rand_like(box_target) * 2 - 1
-        noise *= box_target.new_tensor(self.dn_noise_scale)
-        dn_anchor = box_target + noise
-        if self.add_neg_dn:
-            noise_neg = torch.rand_like(box_target) + 1
+        # ========= 正样本噪声添加 =========
+        # 1. 生成[-1, 1]范围的随机噪声，维度 [B*num_dn_groups, num_gt, bbox_dim]
+        noise = torch.rand_like(box_target) * 2 - 1  # 均匀分布[-1, 1]
+        # 2. 缩放噪声幅度，默认dn_noise_scale=0.5
+        noise *= box_target.new_tensor(self.dn_noise_scale)  # 噪声幅度缩放
+        # 3. 将噪声添加到GT边框上生成噪声锚点
+        dn_anchor = box_target + noise  # GT + 小幅度噪声 = 正样本噪壳锚点
+        # ========= 负样本噪声添加（可选） =========
+        if self.add_neg_dn:  # 默认True，添加负样本噪声
+            # 1. 生成[1, 2]范围的大幅度噪声
+            noise_neg = torch.rand_like(box_target) + 1  # 均匀分布[1, 2]
+            # 2. 随机决定噪声的正负方向（每个维度独立）
             flag = torch.where(
-                torch.rand_like(box_target) > 0.5,
-                noise_neg.new_tensor(1),
-                noise_neg.new_tensor(-1),
+                torch.rand_like(box_target) > 0.5,  # 50%概率
+                noise_neg.new_tensor(1),   # 正方向
+                noise_neg.new_tensor(-1),  # 负方向
             )
-            noise_neg *= flag
+            noise_neg *= flag  # 应用方向
+            # 3. 缩放噪声幅度
             noise_neg *= box_target.new_tensor(self.dn_noise_scale)
+            # 4. 拼接正样本噪声和负样本噪声
+            # 维度从 [B*num_dn_groups, num_gt, bbox_dim] -> [B*num_dn_groups, 2*num_gt, bbox_dim]
             dn_anchor = torch.cat([dn_anchor, box_target + noise_neg], dim=1)
-            num_gt *= 2
+            num_gt *= 2  # GT数量翻倍（正样本+负样本）
 
         box_cost = self._box_cost(
             dn_anchor, box_target, torch.ones_like(box_target)
@@ -230,15 +263,19 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
             if gt_instance_id is not None:
                 dn_id_target = torch.cat([dn_id_target, dn_id_target], dim=1)
 
-        for i in range(dn_anchor.shape[0]):
-            cost = box_cost[i].cpu().numpy()
+        # ========= 匈牙利匹配：将噪声锚点与最近的GT关联 =========
+        # 这一步是为了确保每个噪声锚点都有对应的目标GT
+        for i in range(dn_anchor.shape[0]):  # 遍历每个批次
+            cost = box_cost[i].cpu().numpy()  # 获取噪壳锚点与GT之间的距离成本矩阵
+            # 使用匈牙利算法找到最优匹配（最小成本）
             anchor_idx, gt_idx = linear_sum_assignment(cost)
             anchor_idx = dn_anchor.new_tensor(anchor_idx, dtype=torch.int64)
             gt_idx = dn_anchor.new_tensor(gt_idx, dtype=torch.int64)
-            dn_box_target[i, anchor_idx] = box_target[i, gt_idx]
-            dn_cls_target[i, anchor_idx] = cls_target[i, gt_idx]
+            # 为匹配的噪壳锚点分配对应的GT目标
+            dn_box_target[i, anchor_idx] = box_target[i, gt_idx]    # 回归目标
+            dn_cls_target[i, anchor_idx] = cls_target[i, gt_idx]    # 分类目标
             if gt_instance_id is not None:
-                dn_id_target[i, anchor_idx] = gt_instance_id[i, gt_idx]
+                dn_id_target[i, anchor_idx] = gt_instance_id[i, gt_idx]  # 实例ID目标
         dn_anchor = (
             dn_anchor.reshape(self.num_dn_groups, bs, num_gt, state_dims)
             .permute(1, 0, 2, 3)
@@ -273,14 +310,17 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
             valid_mask = torch.logical_or(
                 valid_mask, ((cls_target >= 0) & (dn_cls_target == -3))
             )  # valid denotes the items is not from pad.
+        # ========= 生成注意力掩码 =========
+        # 防止不同去噪组之间的交互，保证去噪训练的独立性
         attn_mask = dn_box_target.new_ones(
             num_gt * self.num_dn_groups, num_gt * self.num_dn_groups
-        )
-        for i in range(self.num_dn_groups):
+        )  # 初始化为全1（禁止交互）
+        # 允许同一组内的噪壳锚点之间交互
+        for i in range(self.num_dn_groups):  # 遍历每个去噪组
             start = num_gt * i
             end = start + num_gt
-            attn_mask[start:end, start:end] = 0
-        attn_mask = attn_mask == 1
+            attn_mask[start:end, start:end] = 0  # 同组内可交互（设为0）
+        attn_mask = attn_mask == 1  # 转换为bool类型，True表示禁止交互
         dn_cls_target = dn_cls_target.long()
         return (
             dn_anchor,

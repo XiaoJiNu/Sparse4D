@@ -162,9 +162,37 @@ class Sparse4DHead(BaseModule):
 
     def forward(
         self,
-        feature_maps: Union[torch.Tensor, List],
-        metas: dict,
+        feature_maps: Union[torch.Tensor, List],  # 输入特征图，维度为 [B, C, H, W] 或特征图列表
+        metas: dict,  # 包含图像元数据和GT标注信息的字典
     ):
+        """
+        Sparse4D头部的前向传播函数
+        
+        输入:
+            feature_maps: 特征图张量或列表，维度为 [B, C, H, W]
+            metas: 元数据字典，包含:
+                - img_metas: 图像元信息
+                - gt_labels_3d: 3D标签真值，维度为 [B, N_gt]
+                - gt_bboxes_3d: 3D边框真值，维度为 [B, N_gt, bbox_dim]
+                
+        输出:
+            output: 包含预测结果的字典，包括:
+                - classification: 分类预测结果列表，每个元素维度为 [B, N_anchor, num_classes] 
+                - prediction: 回归预测结果列表，每个元素维度为 [B, N_anchor, bbox_dim]
+                - quality: 质量预测结果列表（可选）
+                - dn_prediction: 去噪预测结果列表（训练时且启用去噪时）
+                - dn_classification: 去噪分类结果列表（训练时且启用去噪时）
+                - dn_reg_target: 去噪回归目标（训练时且启用去噪时）
+                - dn_cls_target: 去噪分类目标（训练时且启用去噪时）
+                - instance_id: 实例ID（推理时）
+                
+        实现逻辑:
+        1. 从实例库获取实例特征和锚点
+        2. 如果是训练模式，准备去噪训练数据
+        3. 通过多层transformer进行特征处理
+        4. 分离学习实例和噪声实例的预测结果
+        5. 缓存当前实例用于时序建模
+        """
         if isinstance(feature_maps, torch.Tensor):
             feature_maps = [feature_maps]
         batch_size = feature_maps[0].shape[0]
@@ -185,14 +213,16 @@ class Sparse4DHead(BaseModule):
             batch_size, metas, dn_metas=self.sampler.dn_metas
         )
 
-        # ========= prepare for denosing training ============
-        # 1. get dn metas: noisy-anchors and corresponding GT
-        # 2. concat learnable instances and noisy instances
-        # 3. get attention mask
-        attn_mask = None
-        dn_metas = None
-        temp_dn_reg_target = None
+        # ========= 准备去噪训练 ============
+        # 1. 获取去噪元数据：噪声锚点和对应的GT
+        # 2. 拼接可学习实例和噪声实例
+        # 3. 获取注意力掩码
+        attn_mask = None  # 注意力掩码，维度为 [N_total, N_total]，控制实例间的注意力交互
+        dn_metas = None   # 去噪元数据，包含噪声锚点和目标
+        temp_dn_reg_target = None  # 时序去噪回归目标
+        # 只在训练模式且采样器支持去噪时生成去噪数据
         if self.training and hasattr(self.sampler, "get_dn_anchors"):
+            # 检查是否有实例ID信息，用于时序追踪
             if "instance_id" in metas["img_metas"][0]:
                 gt_instance_id = [
                     torch.from_numpy(x["instance_id"]).cuda()
@@ -200,21 +230,22 @@ class Sparse4DHead(BaseModule):
                 ]
             else:
                 gt_instance_id = None
+            # 调用采样器生成去噪数据：噪声锚点、目标、掩码等
             dn_metas = self.sampler.get_dn_anchors(
-                metas[self.gt_cls_key],
-                metas[self.gt_reg_key],
-                gt_instance_id,
+                metas[self.gt_cls_key],    # GT分类标签，维度 [B, N_gt]
+                metas[self.gt_reg_key],    # GT回归标签，维度 [B, N_gt, bbox_dim]
+                gt_instance_id,            # GT实例ID（可选）
             )
         if dn_metas is not None:
             (
-                dn_anchor,
-                dn_reg_target,
-                dn_cls_target,
-                dn_attn_mask,
-                valid_mask,
-                dn_id_target,
+                dn_anchor,      # 去噪锚点，维度为 [B, N_dn, anchor_dim]
+                dn_reg_target,  # 去噪回归目标，维度为 [B, N_dn, bbox_dim]
+                dn_cls_target,  # 去噪分类目标，维度为 [B, N_dn]
+                dn_attn_mask,   # 去噪注意力掩码，维度为 [N_dn, N_dn]
+                valid_mask,     # 有效掩码，维度为 [B, N_dn]
+                dn_id_target,   # 去噪ID目标，维度为 [B, N_dn]（可选）
             ) = dn_metas
-            num_dn_anchor = dn_anchor.shape[1]
+            num_dn_anchor = dn_anchor.shape[1]  # 去噪锚点数量
             if dn_anchor.shape[-1] != anchor.shape[-1]:
                 remain_state_dims = anchor.shape[-1] - dn_anchor.shape[-1]
                 dn_anchor = torch.cat(
@@ -342,25 +373,36 @@ class Sparse4DHead(BaseModule):
 
         output = {}
 
-        # split predictions of learnable instances and noisy instances
+        # 分离学习实例和噪声实例的预测结果
+        # 这里是model_outs中dn_prediction生成的关键位置
         if dn_metas is not None:
+            # 提取去噪分类预测结果：取后num_dn_anchor个实例的分类预测
+            # 维度：每个元素为 [B, N_dn, num_classes]
             dn_classification = [
                 x[:, num_free_instance:] for x in classification
             ]
+            # 保留前num_free_instance个学习实例的分类预测
+            # 维度：每个元素为 [B, N_free, num_classes]
             classification = [x[:, :num_free_instance] for x in classification]
+            # 提取去噪回归预测结果：取后num_dn_anchor个实例的回归预测
+            # 维度：每个元素为 [B, N_dn, bbox_dim] - 这就是dn_prediction！
             dn_prediction = [x[:, num_free_instance:] for x in prediction]
+            # 保留前num_free_instance个学习实例的回归预测
+            # 维度：每个元素为 [B, N_free, bbox_dim]
             prediction = [x[:, :num_free_instance] for x in prediction]
             quality = [
                 x[:, :num_free_instance] if x is not None else None
                 for x in quality
             ]
+            # 将去噪相关的预测结果添加到输出字典中
+            # 这里是dn_prediction被添加到model_outs的地方
             output.update(
                 {
-                    "dn_prediction": dn_prediction,
-                    "dn_classification": dn_classification,
-                    "dn_reg_target": dn_reg_target,
-                    "dn_cls_target": dn_cls_target,
-                    "dn_valid_mask": valid_mask,
+                    "dn_prediction": dn_prediction,        # 去噪回归预测，列表，每个元素维度 [B, N_dn, bbox_dim]
+                    "dn_classification": dn_classification,  # 去噪分类预测，列表，每个元素维度 [B, N_dn, num_classes]
+                    "dn_reg_target": dn_reg_target,        # 去噪回归目标，维度 [B, N_dn, bbox_dim]
+                    "dn_cls_target": dn_cls_target,        # 去噪分类目标，维度 [B, N_dn]
+                    "dn_valid_mask": valid_mask,           # 去噪有效掩码，维度 [B, N_dn]
                 }
             )
             if temp_dn_reg_target is not None:
@@ -409,6 +451,28 @@ class Sparse4DHead(BaseModule):
 
     @force_fp32(apply_to=("model_outs"))
     def loss(self, model_outs, data, feature_maps=None):
+        """
+        计算损失函数
+        
+        输入:
+            model_outs: 模型输出字典，包含:
+                - classification: 分类预测列表，每个元素维度 [B, N_anchor, num_classes]
+                - prediction: 回归预测列表，每个元素维度 [B, N_anchor, bbox_dim]
+                - quality: 质量预测列表（可选）
+                - dn_prediction: 去噪回归预测列表（仅在启用去噪时存在）
+                - dn_classification: 去噪分类预测列表（仅在启用去噪时存在）
+                - 其他去噪相关字段
+            data: 包含GT数据的字典
+            feature_maps: 特征图（可选）
+            
+        输出:
+            output: 损失字典，包含各decoder层的分类和回归损失
+            
+        实现逻辑:
+        1. 计算常规预测的损失（所有decoder层）
+        2. 如果存在dn_prediction，计算去噪损失
+        3. 返回所有损失的字典
+        """
         # ===================== prediction losses ======================
         cls_scores = model_outs["classification"]
         reg_preds = model_outs["prediction"]
@@ -466,12 +530,19 @@ class Sparse4DHead(BaseModule):
             output[f"loss_cls_{decoder_idx}"] = cls_loss
             output.update(reg_loss)
 
+        # 检查是否存在去噪预测结果
+        # 条件成立的情况：
+        # 1. 推理模式（self.training=False）时，不会生成dn_prediction
+        # 2. 训练模式但采样器不支持去噪（没有get_dn_anchors方法）
+        # 3. 训练模式但当前批次没有GT数据，导致dn_metas为None
+        # 4. 训练模式但由于其他原因导致去噪数据生成失败
         if "dn_prediction" not in model_outs:
-            return output
+            return output  # 直接返回常规预测的损失，不计算去噪损失
 
-        # ===================== denoising losses ======================
-        dn_cls_scores = model_outs["dn_classification"]
-        dn_reg_preds = model_outs["dn_prediction"]
+        # ===================== 去噪损失计算 ======================
+        # 获取去噪预测结果
+        dn_cls_scores = model_outs["dn_classification"]  # 去噪分类预测，列表，每个元素维度 [B, N_dn, num_classes]
+        dn_reg_preds = model_outs["dn_prediction"]       # 去噪回归预测，列表，每个元素维度 [B, N_dn, bbox_dim]
 
         (
             dn_valid_mask,
@@ -516,18 +587,54 @@ class Sparse4DHead(BaseModule):
         return output
 
     def prepare_for_dn_loss(self, model_outs, prefix=""):
-        dn_valid_mask = model_outs[f"{prefix}dn_valid_mask"].flatten(end_dim=1)
+        """
+        为去噪损失计算准备数据
+        
+        输入:
+            model_outs: 模型输出字典，包含去噪相关数据
+            prefix: 前缀字符串，用于支持时序去噪（如"temp_"）
+            
+        输出:
+            返回元组，包含:
+            - dn_valid_mask: 去噪有效掩码，维度 [B*N_dn] -> bool类型
+            - dn_cls_target: 有效的去噪分类目标，维度 [N_valid]
+            - dn_reg_target: 正样本的去噪回归目标，维度 [N_pos, bbox_dim]
+            - dn_pos_mask: 正样本掩码，维度 [N_valid] -> bool类型
+            - reg_weights: 回归损失权重，维度 [N_pos, bbox_dim]
+            - num_dn_pos: 有效正样本数量，标量
+            
+        实现逻辑:
+        1. 获取去噪数据并展平为1D
+        2. 过滤出有效的数据（valid_mask=True）
+        3. 过滤出正样本（cls_target>=0）
+        4. 准备回归损失的权重
+        5. 计算有效正样本数量用于平均
+        """
+        # 1. 获取去噪数据并展平为1D形状
+        dn_valid_mask = model_outs[f"{prefix}dn_valid_mask"].flatten(end_dim=1)  # [B, N_dn] -> [B*N_dn]
+        
+        # 2. 使用valid_mask过滤出有效的去噪数据
         dn_cls_target = model_outs[f"{prefix}dn_cls_target"].flatten(
-            end_dim=1
-        )[dn_valid_mask]
+            end_dim=1  # [B, N_dn] -> [B*N_dn]
+        )[dn_valid_mask]  # 只保留有效的目标 -> [N_valid]
+        
+        # 3. 获取有效的回归目标，并截取到指定维度
         dn_reg_target = model_outs[f"{prefix}dn_reg_target"].flatten(
-            end_dim=1
-        )[dn_valid_mask][..., : len(self.reg_weights)]
-        dn_pos_mask = dn_cls_target >= 0
-        dn_reg_target = dn_reg_target[dn_pos_mask]
+            end_dim=1  # [B, N_dn, bbox_dim] -> [B*N_dn, bbox_dim]
+        )[dn_valid_mask][..., : len(self.reg_weights)]  # [N_valid, bbox_dim] 截取到指定维度
+        
+        # 4. 找出正样本（类别标签>=0的样本）
+        dn_pos_mask = dn_cls_target >= 0  # [N_valid] -> bool掩码，标记正样本
+        
+        # 5. 只保留正样本的回归目标
+        dn_reg_target = dn_reg_target[dn_pos_mask]  # [N_pos, bbox_dim]
+        
+        # 6. 准备回归损失的权重，为每个正样本复制一份权重
         reg_weights = dn_reg_target.new_tensor(self.reg_weights)[None].tile(
-            dn_reg_target.shape[0], 1
+            dn_reg_target.shape[0], 1  # [N_pos, bbox_dim]
         )
+        
+        # 7. 计算有效正样本数量，用于损失平均，最小为1.0避免除零
         num_dn_pos = max(
             reduce_mean(torch.sum(dn_valid_mask).to(dtype=reg_weights.dtype)),
             1.0,
@@ -543,6 +650,24 @@ class Sparse4DHead(BaseModule):
 
     @force_fp32(apply_to=("model_outs"))
     def post_process(self, model_outs, output_idx=-1):
+        """
+        后处理函数，将原始预测结果解码为最终的检测结果
+        
+        输入:
+            model_outs: 模型输出字典，包含:
+                - classification: 分类预测列表
+                - prediction: 回归预测列表 
+                - instance_id: 实例ID（可选）
+                - quality: 质量预测（可选）
+            output_idx: 使用哪个解码器层的输出，-1表示最后一层
+            
+        输出:
+            解码后的检测结果，包含边框、分数、标签等
+            
+        注意:
+            - 这个函数不处理dn_prediction，因为去噪预测只用于训练
+            - 只在推理时调用，训练时不会调用这个函数
+        """
         return self.decoder.decode(
             model_outs["classification"],
             model_outs["prediction"],

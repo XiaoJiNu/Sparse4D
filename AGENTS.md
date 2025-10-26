@@ -17,3 +17,6 @@ Recent history uses short, descriptive summaries (often Chinese verbs).  Aim for
 
 ## Data & Configuration Tips
 Store environment-specific paths in `.env` files or shell exports rather than hard-coding them in configs.  Check large assets into external storage and version download URLs in `resources/` or `docs/`.  When creating new configs, start from the closest template in `projects/configs` and document deviations at the top of the file for faster reviews.
+
+#
+用中文沟通
